@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: Slajkon Buddy
+## Notes: Keep and share lightweight reviews of players you group with.
+## Author: Slajkon
+## Version: 1.0.0
+## OptionalDeps: EllesmereUI, EllesmereUIBlizzardSkin
+## SavedVariables: SlajkonBuddyDB
+
+SlajkonBuddy.lua
