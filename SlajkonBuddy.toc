@@ -2,7 +2,7 @@
 ## Title: Slajkon Buddy
 ## Notes: Keep and share lightweight reviews of players you group with.
 ## Author: Slajkon
-## Version: 1.0.0
+## Version: 1.0.1
 ## OptionalDeps: EllesmereUI, EllesmereUIBlizzardSkin
 ## SavedVariables: SlajkonBuddyDB
 

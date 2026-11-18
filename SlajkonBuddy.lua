@@ -56,6 +56,7 @@ local RefreshRatingDetails
 local EnqueueDeletion
 local EnqueuePlayerMetadata
 local HookUnitFrameTooltips
+local OpenReviewQueue
 
 local function Trim(value)
 	value = tostring(value or "")
@@ -95,6 +96,28 @@ local function FormatPlayerDisplay(value)
 	return value
 end
 
+local function PlayerIdentityFromParts(name, realm)
+	name = SafeText(name, 80)
+	realm = SafeText(realm, 80)
+	if name == "" then
+		return nil, nil
+	end
+
+	-- WoW: Forever exposes first and last names as either "First Last" or
+	-- "First-Last" on some APIs. Keep that pair together instead of appending
+	-- the local realm, and use spaces for the display/contact form.
+	if name:match("%s") or name:find("-", 1, true) then
+		local display = FormatPlayerDisplay(name)
+		return string.lower(display:gsub("%s+", "-")), display
+	end
+	if realm == "" then
+		realm = RealmName()
+	end
+	local key = realm ~= "" and (name .. "-" .. realm) or name
+	local display = realm ~= "" and (name .. " " .. realm) or name
+	return string.lower(key), display
+end
+
 local function PlayerIdentity(unit)
 	local name, realm
 	if type(UnitFullName) == "function" then
@@ -106,12 +129,7 @@ local function PlayerIdentity(unit)
 	if not name or name == "" then
 		return nil, nil
 	end
-	if not realm or realm == "" then
-		realm = RealmName()
-	end
-	local key = realm ~= "" and (name .. "-" .. realm) or name
-	local display = realm ~= "" and (name .. " " .. realm) or name
-	return string.lower(key), display
+	return PlayerIdentityFromParts(name, realm)
 end
 
 local function NormalizePlayerName(value)
@@ -138,13 +156,11 @@ local function PlayerContactName(key)
 		return nil
 	end
 	local entry = db and db.players and db.players[key]
-	local display = entry and entry.display or FormatPlayerDisplay(key)
-	local keyName, keyRealm = key:match("^([^-]+)%-(.+)$")
-	if not keyName then
-		return display
+	local display = entry and entry.display
+	if type(display) ~= "string" or display == "" then
+		display = FormatPlayerDisplay(key)
 	end
-	local displayName, displayRealm = display:match("^([^%s]+)%s+(.+)$")
-	return (displayName or keyName) .. "-" .. (displayRealm or keyRealm)
+	return SafeText(display, 80)
 end
 
 local function InvitePlayer(key)
@@ -410,32 +426,39 @@ local function IsMyReview(review, storageKey)
 		return true
 	end
 	local normalizedKey = authorKey and NormalizePlayerName(authorKey)
-	if normalizedKey == playerKey then
+	if normalizedKey == playerKey or (normalizedKey and db.ownCharacters and db.ownCharacters[normalizedKey]) then
 		return true
 	end
 	local authorDisplay = type(review) == "table" and review.authorDisplay
 	local displayHasRealm = type(authorDisplay) == "string"
 		and (authorDisplay:find("-", 1, true) or authorDisplay:match("^[^%s]+%s+.+$"))
 	local displayKey = displayHasRealm and NormalizePlayerName(authorDisplay)
-	return displayKey ~= nil and displayKey == playerKey
+	return displayKey ~= nil and (displayKey == playerKey or (db.ownCharacters and db.ownCharacters[displayKey]))
 end
 
-local function GetMyReview(key)
+local function GetMyReview(key, requestedAuthorKey)
 	local entry = db.players[key]
 	if not entry or type(entry.reviews) ~= "table" then
 		return nil
 	end
+	local requestedKey = requestedAuthorKey and NormalizePlayerName(requestedAuthorKey)
+	local selectedReview, selectedStorageKey, selectedUpdated = nil, nil, -1
 	for storageKey, review in pairs(entry.reviews) do
-		if IsMyReview(review, storageKey) then
-			return review
+		local authorKey = ReviewAuthorKey(review, storageKey)
+		if IsMyReview(review, storageKey) and (not requestedKey or NormalizePlayerName(authorKey) == requestedKey) then
+			local updated = tonumber(review.updated) or 0
+			if updated > selectedUpdated or (updated == selectedUpdated and (not selectedStorageKey or storageKey < selectedStorageKey)) then
+				selectedReview, selectedStorageKey, selectedUpdated = review, storageKey, updated
+			end
 		end
 	end
-	return nil
+	return selectedReview, selectedStorageKey
 end
 
-local function NextReviewTimestamp(key)
-	local previous = GetMyReview(key)
-	local deletedAt = GetDeletionTimestamp(key, playerKey) or 0
+local function NextReviewTimestamp(key, authorKey)
+	authorKey = authorKey or playerKey
+	local previous = GetMyReview(key, authorKey)
+	local deletedAt = GetDeletionTimestamp(key, authorKey) or 0
 	local previousAt = previous and tonumber(previous.updated) or 0
 	return math.max(time(), deletedAt + 1, previousAt + 1)
 end
@@ -1122,7 +1145,7 @@ local function HandlePacket(message, sender, senderKey)
 	end
 end
 
-local function OpenReviewQueue(targets, title)
+OpenReviewQueue = function(targets, title, editOnly, requestedReturnPage)
 	for _, target in ipairs(targets) do
 		local classToken, level = PlayerUnitInfo(target.key)
 		target.class = SafeClassToken(target.class) or classToken
@@ -1134,8 +1157,17 @@ local function OpenReviewQueue(targets, title)
 		end
 		return
 	end
-	local returnToMain = mainFrame and mainFrame:IsShown() and mainPage and mainPage:IsShown()
-	activeQueue = { targets = targets, title = title, index = 1, returnToMain = returnToMain }
+	local returnPage = requestedReturnPage
+	if not returnPage and mainFrame and mainFrame:IsShown() then
+		if mainPage and mainPage:IsShown() then
+			returnPage = mainPage
+		elseif ratingDetailsPage and ratingDetailsPage:IsShown() then
+			returnPage = ratingDetailsPage
+		elseif ignoredListPage and ignoredListPage:IsShown() then
+			returnPage = ignoredListPage
+		end
+	end
+	activeQueue = { targets = targets, title = title, index = 1, returnPage = returnPage, editOnly = editOnly }
 	if not mainFrame then
 		CreateMainFrame()
 	end
@@ -1155,7 +1187,7 @@ local function OpenReviewQueue(targets, title)
 end
 
 local function CloseReviewFlow(forceClose)
-	local returnToMain = activeQueue and activeQueue.returnToMain
+	local returnPage = activeQueue and activeQueue.returnPage
 	activeQueue = nil
 	if reviewFrame then
 		reviewFrame:Hide()
@@ -1168,8 +1200,12 @@ local function CloseReviewFlow(forceClose)
 	end
 	if mainFrame then
 		mainFrame:SetHeight(MAIN_FRAME_HEIGHT)
-		mainPage:Show()
-		if forceClose or not returnToMain then
+		if returnPage then
+			returnPage:Show()
+		elseif mainPage then
+			mainPage:Show()
+		end
+		if forceClose or not returnPage then
 			mainFrame:Hide()
 		else
 			mainFrame:Show()
@@ -1538,7 +1574,7 @@ CreateRatingDetailsPage = function()
 	ratingDetailsPage.summary = summary
 
 	local removeButton = CreateButton(ratingDetailsPage, "Remove", 104, 24)
-	removeButton:SetPoint("TOP", -104, -96)
+	removeButton:SetPoint("TOP", 104, -96)
 	removeButton:SetScript("OnClick", function()
 		local key = ratingDetailsPage.targetKey
 		local entry = key and db.players[key]
@@ -1591,14 +1627,14 @@ CreateRatingDetailsPage = function()
 	ratingDetailsPage.removeButton = removeButton
 
 	local inviteButton = CreateButton(ratingDetailsPage, "Invite", 96, 24)
-	inviteButton:SetPoint("LEFT", removeButton, "RIGHT", 8, 0)
+	inviteButton:SetPoint("TOP", -108, -96)
 	inviteButton:SetScript("OnClick", function()
 		InvitePlayer(ratingDetailsPage.targetKey)
 	end)
 	ratingDetailsPage.inviteButton = inviteButton
 
 	local whisperButton = CreateButton(ratingDetailsPage, "Whisper", 96, 24)
-	whisperButton:SetPoint("LEFT", inviteButton, "RIGHT", 8, 0)
+	whisperButton:SetPoint("TOP", -4, -96)
 	whisperButton:SetScript("OnClick", function()
 		WhisperPlayer(ratingDetailsPage.targetKey)
 	end)
@@ -1614,6 +1650,24 @@ CreateRatingDetailsPage = function()
 		header:SetWidth(500)
 		header:SetJustifyH("LEFT")
 		row.header = header
+
+		local editButton = CreateButton(row, "Edit", 54, 22)
+		editButton:SetPoint("RIGHT", -2, 0)
+		editButton:SetScript("OnClick", function()
+			local key = row.targetKey
+			local authorKey = row.reviewAuthorKey
+			local entry = key and db.players[key]
+			if key and authorKey and entry and GetMyReview(key, authorKey) then
+				OpenReviewQueue({ {
+					key = key,
+					display = entry.display or key,
+					class = entry.class,
+					level = entry.level,
+					authorKey = authorKey,
+				} }, "Edit your review", true, ratingDetailsPage)
+			end
+		end)
+		row.editButton = editButton
 
 		local details = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 		details:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -3)
@@ -1761,7 +1815,7 @@ RefreshMainFrame = function()
 			row.playerKey = player.key
 
 			local tagCounts = {}
-			local ownDescription
+			local ownDescription, ownDescriptionTime, ownDescriptionAuthor = nil, -1, nil
 			local latestDescription, latestDescriptionTime, latestDescriptionAuthor = nil, -1, nil
 			local entry = db.players[player.key]
 			for authorKey, review in pairs(entry and entry.reviews or {}) do
@@ -1770,8 +1824,13 @@ RefreshMainFrame = function()
 					local updated = tonumber(review.updated) or 0
 					local reviewAuthor = review.authorKey or authorKey
 					if comment ~= "" then
-						if reviewAuthor == playerKey then
-							ownDescription = comment
+						if IsMyReview(review, authorKey) then
+							if updated > ownDescriptionTime
+								or (updated == ownDescriptionTime and (not ownDescriptionAuthor or reviewAuthor < ownDescriptionAuthor)) then
+								ownDescription = comment
+								ownDescriptionTime = updated
+								ownDescriptionAuthor = reviewAuthor
+							end
 						elseif updated > latestDescriptionTime
 							or (updated == latestDescriptionTime and (not latestDescriptionAuthor or reviewAuthor < latestDescriptionAuthor)) then
 							latestDescription = comment
@@ -1956,10 +2015,17 @@ RefreshRatingDetails = function(key)
 	for index, row in ipairs(ratingDetailsPage.rows) do
 		local review = reviews[first + index - 1]
 		if review then
-			local isIgnored = not IsMyReview(review, review.authorKey)
+			local isOwnReview = IsMyReview(review, review.authorKey)
+			local isIgnored = not isOwnReview
 				and IsRatingIgnored(key, review.authorKey)
 			local direction = review.direction == 1 and "Thumbs up" or "Thumbs down"
 			local display = review.authorDisplay or FormatPlayerDisplay(review.authorKey or "Player")
+			row.targetKey = key
+			row.reviewAuthorKey = ReviewAuthorKey(review, review.authorKey)
+			row.editButton:SetShown(isOwnReview)
+			local contentWidth = isOwnReview and 420 or 500
+			row.header:SetWidth(contentWidth)
+			row.details:SetWidth(contentWidth)
 			row.header:SetText(string.format("%s  ·  %s%s", direction, display,
 				isIgnored and " (ignored locally)" or ""))
 			if isIgnored then
@@ -1989,9 +2055,12 @@ RefreshRatingDetails = function(key)
 			row.header:SetPoint("TOPLEFT", 3, -topOffset)
 			row.details:ClearAllPoints()
 			row.details:SetPoint("TOPLEFT", row.header, "BOTTOMLEFT", 0, -3)
-			row.details:SetHeight(math.max(1, detailsHeight))
+			row.details:SetSize(contentWidth, math.max(1, detailsHeight))
 			row:Show()
 		else
+			row.targetKey = nil
+			row.reviewAuthorKey = nil
+			row.editButton:Hide()
 			row:Hide()
 		end
 	end
@@ -2035,8 +2104,10 @@ local function LoadReviewStep()
 	end
 	local target = activeQueue.targets[activeQueue.index]
 	reviewState = { direction = nil, selectedTags = {}, comment = "" }
-	local previous = GetMyReview(target.key)
+	local previous, previousStorageKey = GetMyReview(target.key, target.authorKey)
 	if previous then
+		reviewState.authorKey = ReviewAuthorKey(previous, previousStorageKey)
+		reviewState.authorDisplay = previous.authorDisplay
 		reviewState.direction = previous.direction
 		reviewState.comment = previous.comment or ""
 		for _, tag in ipairs(NormalizeTags(previous.tags, previous.direction)) do
@@ -2066,6 +2137,22 @@ local function LoadReviewStep()
 	reviewFrame.comment:ClearAllPoints()
 	reviewFrame.comment:SetPoint("TOPLEFT", 32, hasTitle and -198 or -174)
 	RefreshReviewControls()
+	reviewFrame.saveButton:SetText(activeQueue.editOnly and "Save changes" or "Save & next")
+	reviewFrame.saveButton:ClearAllPoints()
+	reviewFrame.skipPlayerButton:ClearAllPoints()
+	reviewFrame.skipAllButton:ClearAllPoints()
+	if activeQueue.editOnly then
+		reviewFrame.saveButton:SetPoint("BOTTOMLEFT", 146, 12)
+		reviewFrame.skipPlayerButton:SetText("Cancel")
+		reviewFrame.skipPlayerButton:SetPoint("LEFT", reviewFrame.saveButton, "RIGHT", 8, 0)
+		reviewFrame.skipAllButton:Hide()
+	else
+		reviewFrame.saveButton:SetPoint("BOTTOMLEFT", 82, 12)
+		reviewFrame.skipPlayerButton:SetText("Skip player")
+		reviewFrame.skipPlayerButton:SetPoint("LEFT", reviewFrame.saveButton, "RIGHT", 8, 0)
+		reviewFrame.skipAllButton:SetPoint("LEFT", reviewFrame.skipPlayerButton, "RIGHT", 8, 0)
+		reviewFrame.skipAllButton:Show()
+	end
 	reviewFrame:Show()
 end
 
@@ -2156,15 +2243,16 @@ CreateReviewFrame = function()
 				tags[#tags + 1] = tag
 			end
 		end
+		local authorKey = reviewState.authorKey or playerKey
 		local review = {
 			targetKey = target.key,
 			targetDisplay = target.display,
-			authorKey = playerKey,
-			authorDisplay = playerDisplay,
+			authorKey = authorKey,
+			authorDisplay = reviewState.authorDisplay or (authorKey == playerKey and playerDisplay or FormatPlayerDisplay(authorKey)),
 			targetClass = target.class,
 			targetLevel = target.level,
 			direction = reviewState.direction,
-			updated = NextReviewTimestamp(target.key),
+			updated = NextReviewTimestamp(target.key, authorKey),
 			tags = tags,
 			comment = SafeText(reviewFrame.comment:GetText(), MAX_COMMENT_LENGTH),
 		}
@@ -2177,8 +2265,11 @@ CreateReviewFrame = function()
 
 	local skipPlayerButton = CreateButton(reviewFrame, "Skip player", 120, 30)
 	skipPlayerButton:SetPoint("LEFT", saveButton, "RIGHT", 8, 0)
+	reviewFrame.skipPlayerButton = skipPlayerButton
 	skipPlayerButton:SetScript("OnClick", function()
-		if activeQueue then
+		if activeQueue and activeQueue.editOnly then
+			CloseReviewFlow(false)
+		elseif activeQueue then
 			activeQueue.index = activeQueue.index + 1
 			LoadReviewStep()
 		end
@@ -2186,6 +2277,7 @@ CreateReviewFrame = function()
 
 	local skipAllButton = CreateButton(reviewFrame, "Skip voting", 120, 30)
 	skipAllButton:SetPoint("LEFT", skipPlayerButton, "RIGHT", 8, 0)
+	reviewFrame.skipAllButton = skipAllButton
 	skipAllButton:SetScript("OnClick", function()
 		CloseReviewFlow(false)
 	end)
@@ -2257,8 +2349,7 @@ local function PlayerIdentityFromGUID(guid)
 		if ok and type(classToken) == "string" and type(name) == "string"
 			and not IsSecretTooltipValue(classToken) and not IsSecretTooltipValue(name)
 			and not IsSecretTooltipValue(realm) then
-			local fullName = realm and realm ~= "" and (name .. "-" .. realm) or name
-			return NormalizePlayerName(fullName)
+			return PlayerIdentityFromParts(name, realm)
 		end
 	end
 	return nil, nil
@@ -2683,10 +2774,33 @@ local function HandleSlashCommand(rawArguments)
 		end
 		return
 	end
+	local command, commandArguments = arguments:match("^(%S+)%s*(.-)$")
+	if command and (command:lower() == "own" or command:lower() == "unown") then
+		if commandArguments == "" then
+			DEFAULT_CHAT_FRAME:AddMessage("Slajkon Buddy: Use /sbuddy own Character-Realm to link one of your characters.")
+			return
+		end
+		local key, display = NormalizePlayerName(commandArguments)
+		if not key then
+			DEFAULT_CHAT_FRAME:AddMessage("Slajkon Buddy: Enter a character name, optionally followed by its realm.")
+			return
+		end
+		if command:lower() == "own" then
+			db.ownCharacters[key] = true
+			DEFAULT_CHAT_FRAME:AddMessage(string.format("Slajkon Buddy: %s is now linked as your character.", display))
+		elseif key == playerKey then
+			DEFAULT_CHAT_FRAME:AddMessage("Slajkon Buddy: Your current character is always linked.")
+		else
+			db.ownCharacters[key] = nil
+			DEFAULT_CHAT_FRAME:AddMessage(string.format("Slajkon Buddy: %s is no longer linked as your character.", display))
+		end
+		RefreshMainFrame()
+		return
+	end
 	local targetName = arguments:gsub("^[Rr][Ee][Vv][Ii][Ee][Ww]%s+", "")
 	local key, display = NormalizePlayerName(targetName)
 	if not key then
-		DEFAULT_CHAT_FRAME:AddMessage("Slajkon Buddy: Use /sbuddy to open ratings or /review Player Name to review someone.")
+		DEFAULT_CHAT_FRAME:AddMessage("Slajkon Buddy: Use /sbuddy to open ratings, /review Player Name to review someone, or /sbuddy own Character-Realm to link an alt.")
 		return
 	end
 	OpenReviewQueue({ { key = key, display = display, class = ClassTokenForPlayer(key) } })
@@ -2725,8 +2839,21 @@ local function Initialize()
 	if type(SlajkonBuddyDB.deletedReviews) ~= "table" then
 		SlajkonBuddyDB.deletedReviews = {}
 	end
-	SlajkonBuddyDB.version = 2
+	if type(SlajkonBuddyDB.ownCharacters) ~= "table" then
+		SlajkonBuddyDB.ownCharacters = {}
+	end
+	SlajkonBuddyDB.version = 3
 	db = SlajkonBuddyDB
+	local normalizedOwnCharacters = {}
+	for characterKey, isOwned in pairs(db.ownCharacters) do
+		if isOwned then
+			local normalizedKey = NormalizePlayerName(characterKey)
+			if normalizedKey then
+				normalizedOwnCharacters[normalizedKey] = true
+			end
+		end
+	end
+	db.ownCharacters = normalizedOwnCharacters
 	for key, entry in pairs(db.players) do
 		if type(entry) == "table" then
 			entry.display = FormatPlayerDisplay(entry.display or key)
@@ -2777,6 +2904,9 @@ local function Initialize()
 	playerKey, playerDisplay = PlayerIdentity("player")
 	if not playerKey then
 		playerKey, playerDisplay = "unknown-player", "Unknown player"
+	end
+	if playerKey ~= "unknown-player" then
+		db.ownCharacters[playerKey] = true
 	end
 	for targetKey, entry in pairs(db.players) do
 		local ignoredForTarget = db.ignoredRatings[targetKey]
